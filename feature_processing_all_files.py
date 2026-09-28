@@ -5,12 +5,10 @@ Created on Tue May 20 13:07:33 2025
 @author: User
 """
 
-
-
 import os
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GroupKFold, StratifiedGroupKFold
 from sklearn.preprocessing import RobustScaler
 from sklearn.ensemble import RandomForestClassifier, IsolationForest
 from sklearn.neighbors import LocalOutlierFactor
@@ -28,28 +26,293 @@ from multiprocessing import Pool, cpu_count
 from functools import partial
 from sklearn.model_selection import StratifiedKFold
 
+
+
 # Define base directory and datasets to process
-BASE_DIR = r"D:\ML_Pore_Typing\Final_run"
+BASE_DIR = r"D:\ML_Pore_Typing_New_Train_Test"
 
 # Define dataset paths and their structure
 DATASETS = [
     {
-        "name": "Pore_features",
+        "name": "Pore_Only",
         "folders": ["All_Features", "DL_Features", "Traditional_Features"],
         "files": ["all_features.csv", "dl_features.csv", "traditional_features.csv"]
     },
     {
-        "name": "Pore_and_neighbourhood_features",
-        "folders": ["All_Features_NI", "DL_Features_NI", "Traditional_Features_NI"],
-        "files": ["all_features_NI.csv", "dl_features_NI.csv", "traditional_features_NI.csv"]
+        "name": "Pore_with_neighborhood",
+        "folders": ["All_Features_with_NI", "DL_Features_with_NI", "Traditional_Features_with_NI"],
+        "files": ["all_features_with_NI.csv", "dl_features_with_NI.csv", "traditional_features_with_NI.csv"]
     }
 ]
+
+
 
 # Helper functions
 def create_directory(directory):
     """Create directory if it doesn't exist."""
     if not os.path.exists(directory):
         os.makedirs(directory)
+
+def extract_image_name(label):
+    """
+    Extract image name from label string.
+    Examples:
+    - 'image_1_cropped_label_10013' -> 'image_1'
+    - 'Modern_2_cropped_label_12379' -> 'Modern_2'
+    """
+    if pd.isna(label):
+        return 'unknown'
+    
+    # Convert to string if not already
+    label_str = str(label)
+    
+    # Split by '_cropped_label_' and take the first part
+    if '_cropped_label_' in label_str:
+        return label_str.split('_cropped_label_')[0]
+    else:
+        # Fallback: try to extract meaningful part before last underscore and number
+        parts = label_str.split('_')
+        if len(parts) > 1:
+            # Remove the last part if it's purely numeric (like label ID)
+            if parts[-1].isdigit():
+                return '_'.join(parts[:-1])
+        return label_str
+
+def create_image_aware_splits(data, target_col, label_col, n_splits=5, random_seed=42):
+    """
+    Create cross-validation splits ensuring samples from the same image 
+    don't appear in both train and test sets within the same fold,
+    while maintaining class balance across folds.
+    """
+    print(f"\n=== CREATING IMAGE-AWARE STRATIFIED {n_splits}-FOLD SPLITS ===")
+    
+    # Extract image names
+    data['image_name'] = data[label_col].apply(extract_image_name)
+    
+    # Print some examples of image name extraction
+    print("\nImage name extraction examples:")
+    sample_labels = data[label_col].head(10).tolist()
+    sample_images = data['image_name'].head(10).tolist()
+    for label, image in zip(sample_labels, sample_images):
+        print(f"  {label} -> {image}")
+    
+    # Get unique images and their class distributions
+    image_info = data.groupby('image_name').agg({
+        target_col: ['nunique', 'first', list],
+        label_col: 'count'
+    }).reset_index()
+    image_info.columns = ['image_name', 'num_classes', 'first_class', 'all_classes', 'sample_count']
+    
+    print(f"\nDataset statistics:")
+    print(f"Total samples: {len(data)}")
+    print(f"Total unique images: {len(image_info)}")
+    print(f"Samples per image - Min: {image_info['sample_count'].min()}, "
+          f"Max: {image_info['sample_count'].max()}, "
+          f"Mean: {image_info['sample_count'].mean():.2f}")
+    
+    # Check for images with multiple classes
+    multi_class_images = image_info[image_info['num_classes'] > 1]
+    if len(multi_class_images) > 0:
+        print(f"\nNote: {len(multi_class_images)} images contain multiple classes:")
+        for _, row in multi_class_images.head(5).iterrows():
+            print(f"  {row['image_name']}: {set(row['all_classes'])} ({row['sample_count']} samples)")
+        if len(multi_class_images) > 5:
+            print(f"  ... and {len(multi_class_images) - 5} more")
+        print("  Using StratifiedGroupKFold to maintain class balance while preventing image leakage.")
+    
+    # Use StratifiedGroupKFold for image-aware + stratified splitting
+    stratified_group_kfold = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_seed)
+    
+    # Create array of image names for each sample (groups)
+    groups = data['image_name'].values
+    X = data.drop(columns=[target_col])
+    y = data[target_col]
+    
+    splits = []
+    fold_idx = 1
+    
+    try:
+        for train_idx, test_idx in stratified_group_kfold.split(X, y, groups):
+            # Get train and test data
+            train_data = data.iloc[train_idx].copy()
+            test_data = data.iloc[test_idx].copy()
+            
+            # Remove the temporary image_name column before saving
+            train_data_clean = train_data.drop(columns=['image_name'])
+            test_data_clean = test_data.drop(columns=['image_name'])
+            
+            # Get image names for verification
+            train_images = set(train_data['image_name'].unique())
+            test_images = set(test_data['image_name'].unique())
+            
+            # Verify no image overlap
+            image_overlap = train_images.intersection(test_images)
+            if len(image_overlap) > 0:
+                print(f"ERROR: Fold {fold_idx} has image overlap: {image_overlap}")
+            else:
+                print(f"Fold {fold_idx}: ✓ No image overlap - {len(train_images)} train images, {len(test_images)} test images")
+            
+            # Calculate and display class distributions
+            train_classes = pd.DataFrame(train_data_clean[target_col].value_counts()).reset_index()
+            train_classes.columns = ['Class', 'Count']
+            test_classes = pd.DataFrame(test_data_clean[target_col].value_counts()).reset_index()
+            test_classes.columns = ['Class', 'Count']
+            
+            # Calculate class percentages
+            train_total = len(train_data_clean)
+            test_total = len(test_data_clean)
+            
+            print(f"  Train class distribution:")
+            for _, row in train_classes.iterrows():
+                pct = (row['Count'] / train_total) * 100
+                print(f"    Class {row['Class']}: {row['Count']} ({pct:.1f}%)")
+            
+            print(f"  Test class distribution:")
+            for _, row in test_classes.iterrows():
+                pct = (row['Count'] / test_total) * 100
+                print(f"    Class {row['Class']}: {row['Count']} ({pct:.1f}%)")
+            
+            # Store split info
+            split_info = {
+                'fold': fold_idx,
+                'train': train_data_clean,
+                'test': test_data_clean,
+                'train_classes': train_classes,
+                'test_classes': test_classes,
+                'train_images': list(train_images),
+                'test_images': list(test_images),
+                'image_overlap': list(image_overlap)
+            }
+            
+            splits.append(split_info)
+            fold_idx += 1
+            
+    except Exception as e:
+        print(f"\n⚠️  StratifiedGroupKFold failed: {e}")
+        print("Falling back to GroupKFold (image-aware but not stratified)...")
+        
+        # Fallback to GroupKFold if StratifiedGroupKFold fails
+        group_kfold = GroupKFold(n_splits=n_splits)
+        splits = []
+        fold_idx = 1
+        
+        for train_idx, test_idx in group_kfold.split(X, y, groups):
+            # Get train and test data
+            train_data = data.iloc[train_idx].copy()
+            test_data = data.iloc[test_idx].copy()
+            
+            # Remove the temporary image_name column before saving
+            train_data_clean = train_data.drop(columns=['image_name'])
+            test_data_clean = test_data.drop(columns=['image_name'])
+            
+            # Get image names for verification
+            train_images = set(train_data['image_name'].unique())
+            test_images = set(test_data['image_name'].unique())
+            
+            # Calculate class distributions
+            train_classes = pd.DataFrame(train_data_clean[target_col].value_counts()).reset_index()
+            train_classes.columns = ['Class', 'Count']
+            test_classes = pd.DataFrame(test_data_clean[target_col].value_counts()).reset_index()
+            test_classes.columns = ['Class', 'Count']
+            
+            print(f"Fold {fold_idx}: {len(train_images)} train images, {len(test_images)} test images")
+            
+            # Store split info
+            split_info = {
+                'fold': fold_idx,
+                'train': train_data_clean,
+                'test': test_data_clean,
+                'train_classes': train_classes,
+                'test_classes': test_classes,
+                'train_images': list(train_images),
+                'test_images': list(test_images),
+                'image_overlap': []
+            }
+            
+            splits.append(split_info)
+            fold_idx += 1
+    
+    # Drop the temporary image_name column from the original data
+    data.drop(columns=['image_name'], inplace=True)
+    
+    return splits
+
+def verify_image_separation(splits, label_col=None):
+    """
+    Verify that images are properly separated between train and test sets
+    and check class balance across folds.
+    Uses pre-computed image lists from splits to avoid Label column dependency.
+    """
+    print("\n=== VERIFYING IMAGE SEPARATION & CLASS BALANCE ===")
+    
+    all_verified = True
+    
+    # Check image separation using pre-computed image lists
+    for i, split in enumerate(splits):
+        fold_num = split['fold']
+        
+        # Use pre-computed image lists instead of extracting from Label column
+        train_images = set(split.get('train_images', []))
+        test_images = set(split.get('test_images', []))
+        
+        # Check for overlap
+        overlap = train_images.intersection(test_images)
+        
+        if len(overlap) > 0:
+            print(f"❌ FOLD {fold_num}: Found {len(overlap)} overlapping images!")
+            print(f"   Overlapping images: {list(overlap)[:5]}{'...' if len(overlap) > 5 else ''}")
+            all_verified = False
+        else:
+            print(f"✅ FOLD {fold_num}: No image overlap ({len(train_images)} train, {len(test_images)} test images)")
+    
+    # Check class balance across folds
+    print("\n=== CLASS BALANCE VERIFICATION ===")
+    
+    # Get overall class distribution
+    all_data = pd.concat([split['train'] for split in splits] + [split['test'] for split in splits])
+    overall_dist = all_data['Class'].value_counts(normalize=True).sort_index()
+    
+    print(f"Overall class distribution:")
+    for class_val, percentage in overall_dist.items():
+        print(f"  Class {class_val}: {percentage:.1%}")
+    
+    print(f"\nPer-fold class distributions:")
+    max_deviation = 0
+    
+    for i, split in enumerate(splits):
+        fold_num = split['fold']
+        train_data = split['train']
+        test_data = split['test']
+        
+        # Calculate train and test distributions
+        train_dist = train_data['Class'].value_counts(normalize=True).sort_index()
+        test_dist = test_data['Class'].value_counts(normalize=True).sort_index()
+        
+        print(f"\n  Fold {fold_num}:")
+        print(f"    Train: {dict(train_dist.round(3))}")
+        print(f"    Test:  {dict(test_dist.round(3))}")
+        
+        # Calculate deviation from overall distribution
+        train_deviation = sum(abs(train_dist.get(c, 0) - overall_dist.get(c, 0)) for c in overall_dist.index)
+        test_deviation = sum(abs(test_dist.get(c, 0) - overall_dist.get(c, 0)) for c in overall_dist.index)
+        
+        max_deviation = max(max_deviation, train_deviation, test_deviation)
+        
+        if train_deviation > 0.2 or test_deviation > 0.2:  # 20% deviation threshold
+            print(f"    ⚠️  Large deviation from overall distribution (train: {train_deviation:.3f}, test: {test_deviation:.3f})")
+        else:
+            print(f"    ✅ Good class balance (train: {train_deviation:.3f}, test: {test_deviation:.3f})")
+    
+    if all_verified:
+        print(f"\n🎉 All folds verified - no image leakage detected!")
+        if max_deviation <= 0.2:
+            print(f"🎯 Good class balance maintained across folds (max deviation: {max_deviation:.3f})")
+        else:
+            print(f"⚠️  Some class imbalance detected (max deviation: {max_deviation:.3f})")
+    else:
+        print(f"\n⚠️  WARNING: Image leakage detected in some folds!")
+    
+    return all_verified
 
 # Modified preprocessing pipeline to run for each dataset
 def run_preprocessing_pipeline(dataset_path, output_dir, csv_filename):
@@ -70,13 +333,58 @@ def run_preprocessing_pipeline(dataset_path, output_dir, csv_filename):
         print(f"Error loading data: {e}")
         return
     
+    # Verify required columns exist
+    if 'Label' not in data.columns:
+        print("ERROR: 'Label' column not found in data. Cannot proceed with image-aware splitting.")
+        return
+    
+    if 'Class' not in data.columns:
+        print("ERROR: 'Class' column not found in data. Cannot proceed.")
+        return
+    
     # Step 1: Remove features with high missing values
     print("\n-- STEP 1: Removing features with high missing values --")
     cleaned_data, removed_features = remove_high_missing_features(data, threshold=0.05)
     
-    # Step 2: Create 5-fold stratified cross-validation splits
-    print("\n-- STEP 2: Creating 5-fold stratified cross-validation splits --")
-    splits = generate_kfold_splits(cleaned_data, "Class")
+    # Step 2: Create 5-fold image-aware stratified cross-validation splits
+    print("\n-- STEP 2: Creating 5-fold image-aware stratified cross-validation splits --")
+    splits = create_image_aware_splits(cleaned_data, "Class", "Label")
+    
+    # Save splits to files
+    create_directory("KFold_Splits")
+    for i, split in enumerate(splits):
+        fold_dir = os.path.join("KFold_Splits", f"Fold_{split['fold']}")
+        create_directory(fold_dir)
+        
+        # Save train and test data WITH Label column for verification
+        split['train'].to_csv(f"{fold_dir}/train_with_labels.csv", index=False)
+        split['test'].to_csv(f"{fold_dir}/test_with_labels.csv", index=False)
+        
+        # OPTION: Save train and test WITHOUT Label column for processing
+        train_no_label = split['train'].drop(columns=['Label']) if 'Label' in split['train'].columns else split['train']
+        test_no_label = split['test'].drop(columns=['Label']) if 'Label' in split['test'].columns else split['test']
+        
+        train_no_label.to_csv(f"{fold_dir}/train.csv", index=False)
+        test_no_label.to_csv(f"{fold_dir}/test.csv", index=False)
+        
+        # Update splits for further processing (remove Label column)
+        split['train'] = train_no_label
+        split['test'] = test_no_label
+        
+        split['train_classes'].to_csv(f"{fold_dir}/train_classes.csv", index=False)
+        split['test_classes'].to_csv(f"{fold_dir}/test_classes.csv", index=False)
+        
+        # Save image lists for verification
+        pd.DataFrame({'train_images': split['train_images']}).to_csv(f"{fold_dir}/train_images.csv", index=False)
+        pd.DataFrame({'test_images': split['test_images']}).to_csv(f"{fold_dir}/test_images.csv", index=False)
+        
+        if split['image_overlap']:
+            pd.DataFrame({'overlapping_images': split['image_overlap']}).to_csv(f"{fold_dir}/image_overlap_WARNING.csv", index=False)
+    
+    # Verify image separation and class balance
+    # Verify image separation and class balance
+    print("\n-- Verifying image separation and class balance --")
+    verify_image_separation(splits)  # ← REMOVE THE "Label" PARAMETER
     
     # Check fold integrity
     print("\n-- Checking fold integrity --")
@@ -122,7 +430,6 @@ def run_preprocessing_pipeline(dataset_path, output_dir, csv_filename):
     
     # Return to base directory
     os.chdir(BASE_DIR)
-
 
 # Step 1: Remove features with high missing values
 def remove_high_missing_features(data, threshold=0.05, save_results=True):
@@ -173,55 +480,6 @@ def remove_high_missing_features(data, threshold=0.05, save_results=True):
     print(f"Cleaned data shape: {data_clean.shape}")
     
     return data_clean, high_missing_features
-
-# Step 2: Create 5-fold stratified cross-validation splits
-def generate_kfold_splits(data, target_col, n_splits=5, random_seed=42):
-    """Generate stratified k-fold cross-validation splits."""
-    # Create output directory
-    create_directory("KFold_Splits")
-    
-    # Initialize the k-fold cross-validator
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_seed)
-    
-    # Lists to store all splits
-    splits = []
-    
-    # Generate the k folds
-    fold_idx = 1
-    for train_index, test_index in skf.split(data.drop(columns=[target_col]), data[target_col]):
-        # Split the data for this fold
-        train_data = data.iloc[train_index].copy()
-        test_data = data.iloc[test_index].copy()
-        
-        # Store class distribution
-        train_classes = pd.DataFrame(train_data[target_col].value_counts()).reset_index()
-        train_classes.columns = ['Class', 'Count']
-        test_classes = pd.DataFrame(test_data[target_col].value_counts()).reset_index()
-        test_classes.columns = ['Class', 'Count']
-        
-        # Save to CSV with fold number
-        fold_dir = os.path.join("KFold_Splits", f"Fold_{fold_idx}")
-        if not os.path.exists(fold_dir):
-            os.makedirs(fold_dir)
-            
-        train_data.to_csv(f"{fold_dir}/train.csv", index=False)
-        test_data.to_csv(f"{fold_dir}/test.csv", index=False)
-        train_classes.to_csv(f"{fold_dir}/train_classes.csv", index=False)
-        test_classes.to_csv(f"{fold_dir}/test_classes.csv", index=False)
-        
-        # Add this split to our list
-        splits.append({
-            'fold': fold_idx,
-            'train': train_data,
-            'test': test_data,
-            'train_classes': train_classes,
-            'test_classes': test_classes
-        })
-        
-        fold_idx += 1
-    
-    print(f"Created {n_splits}-fold stratified cross-validation splits (random_seed={random_seed})")
-    return splits
 
 # Function to check fold integrity
 def check_fold_integrity(splits):
@@ -290,9 +548,13 @@ def remove_zero_variance_iqr(splits, save_summary=True):
         train_data = split['train']
         test_data = split['test']
         
-        # Get feature columns (exclude Label and Class if they exist)
-        meta_cols = ['Label', 'Class'] if 'Label' in train_data.columns else ['Class']
+        # Explicitly identify metadata columns
+        meta_cols = [col for col in ['Label', 'Class'] if col in train_data.columns]
+            
+        # Ensure we're only working with potential feature columns
         features = train_data.drop(columns=meta_cols)
+        
+        print(f"Split {i+1}: Processing {features.shape[1]} feature columns (excluded {len(meta_cols)} metadata columns: {meta_cols})")
         
         # First identify and handle non-numeric columns
         non_numeric_cols = []
@@ -391,13 +653,14 @@ def remove_zero_variance_iqr(splits, save_summary=True):
                 'Remaining features after processing'
             ],
             'Count': [
-                len(splits[0]['train'].columns) - (2 if 'Label' in splits[0]['train'].columns else 1),
+                len([col for col in splits[0]['train'].columns 
+                     if col not in ['Label', 'Class']]),
                 len(set(removed_features[removed_features['Reason'] == 'Non-numeric data']['Feature'])),
                 len(set(removed_features[removed_features['Reason'] == 'Zero variance']['Feature'])),
                 len(set(removed_features[removed_features['Reason'] == 'Zero IQR']['Feature'])),
                 len(set(removed_features[removed_features['Reason'] == 'Not common across splits']['Feature'])),
                 len(splits[0]['train'].columns) - len(common_features),
-                len(common_features) - (2 if 'Label' in splits[0]['train'].columns else 1)
+                len([col for col in common_features if col not in ['Label', 'Class']])
             ]
         })
         
@@ -424,7 +687,7 @@ def save_and_align_splits(splits, directory="Processed_Data_after_zero_variance_
         test_data.to_csv(f"{directory}/test_split{i+1}_original.csv", index=False)
         
         # Get train features
-        meta_cols = ['Label', 'Class'] if 'Label' in train_data.columns else ['Class']
+        meta_cols = [col for col in ['Label', 'Class'] if col in train_data.columns]
         train_features = [col for col in train_data.columns if col not in meta_cols]
         
         # Process test data to match train features
@@ -445,9 +708,8 @@ def save_and_align_splits(splits, directory="Processed_Data_after_zero_variance_
         'Split': range(1, len(splits) + 1),
         'Train_Samples': [len(split['train']) for split in splits],
         'Test_Samples': [len(split['test']) for split in splits],
-        'Feature_Count': [len(split['train'].columns) - len(['Label', 'Class'] 
-                                                         if 'Label' in split['train'].columns 
-                                                         else ['Class']) 
+        'Feature_Count': [len([col for col in split['train'].columns 
+                              if col not in ['Label', 'Class']]) 
                        for split in splits]
     })
     summary.to_csv(f"{directory}/summary.csv", index=False)
@@ -465,8 +727,8 @@ def apply_robust_scaling(splits):
         train_data = split['train']
         test_data = split['test']
         
-        # Separate metadata columns
-        meta_cols = ['Label', 'Class'] if 'Label' in train_data.columns else ['Class']
+        # Separate metadata columns (now only Class since Label was removed)
+        meta_cols = ['Class']
         train_meta = train_data[meta_cols]
         train_features = train_data.drop(columns=meta_cols)
         
@@ -513,9 +775,8 @@ def apply_robust_scaling(splits):
         'Split': range(1, len(splits) + 1),
         'Train_Samples': [len(split['train']) for split in scaled_splits],
         'Test_Samples': [len(split['test']) for split in scaled_splits],
-        'Feature_Count': [len(split['train'].columns) - len(['Label', 'Class'] 
-                                                         if 'Label' in split['train'].columns 
-                                                         else ['Class']) 
+        'Feature_Count': [len([col for col in split['train'].columns 
+                              if col not in ['Label', 'Class']]) 
                        for split in scaled_splits]
     })
     summary.to_csv("Scaled_Results/scaling_summary.csv", index=False)
@@ -535,7 +796,7 @@ def feature_selection_with_mutual_info(splits, correlation_threshold=0.7, mi_per
         test_data = split['test']
         
         # Separate metadata columns
-        meta_cols = ['Label', 'Class'] if 'Label' in train_data.columns else ['Class']
+        meta_cols = [col for col in ['Label', 'Class'] if col in train_data.columns]
         y = train_data['Class']
         X = train_data.drop(columns=meta_cols)
         
@@ -664,7 +925,7 @@ def boruta_feature_selection(splits, n_estimators=250, max_iter=50, perc=70):
         test_data = split_data['test']
         
         # Identify metadata columns
-        meta_cols = ['Label', 'Class'] if 'Label' in train_data.columns else ['Class']
+        meta_cols = [col for col in ['Label', 'Class'] if col in train_data.columns]
         
         # Separate features and target
         y_train = train_data['Class']
@@ -1057,7 +1318,6 @@ def validate_dataset_structure():
     
     return is_valid, missing_items
 
-
 # Main execution function that processes all datasets
 def process_all_datasets():
     """Process all datasets in the specified folders"""
@@ -1125,4 +1385,3 @@ def process_all_datasets():
 # Execute the main function if the script is run directly
 if __name__ == "__main__":
     process_all_datasets()
-        

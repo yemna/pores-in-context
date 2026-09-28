@@ -1,115 +1,93 @@
-# ROI-Based Feature Extraction and Machine Learning Pipeline
+# Pores in Context — feature extraction and classification code
 
-This repository provides an end-to-end pipeline for image-based analysis using
-region-of-interest (ROI) masks. The workflow includes:
+Code for the paper *Pores in Context: Leveraging Matrix-Informed CNN Embeddings for Transparent Carbonate Pore Classification* (Artificial Intelligence in Geosciences).
 
-1. Feature extraction from RGB images using binary masks
-2. Feature preprocessing and selection with leakage-safe cross-validation
-3. Training and benchmarking of ~20 classical machine learning models
-
-The pipeline is designed for scientific and engineering image analysis where
-features must be extracted only from annotated regions.
+The pipeline has three steps: feature extraction from segmented pores, feature preprocessing and selection inside a thin-section-grouped cross-validation, and training/evaluation of 20 classifiers.
 
 ---
 
-## 1. Input Data Requirements
-
-### RGB Images
-- Format: `.png`
-- Color images used for handcrafted and deep feature extraction
-
-### Binary Label Masks
-- Format: `.png`
-- Same spatial dimensions as the corresponding RGB image
-- Pixel encoding:
-  - Background = 0
-  - ROI = 255 (white)
-
-All features are computed **only within the ROI** defined by the mask.
-
----
-
-## 2. Image–Mask Pairing Convention
-
-The feature extraction script automatically pairs images and masks based on
-filename patterns:
-
-- RGB images must contain: `cropped_label`
-- Binary masks must contain: `label_mask`
-
-Expected naming format:
-<prefix>cropped_label<ID>.png
-<prefix>label_mask<ID>.png
-
-
-Example:
-Modern_1_cropped_label_12.png
-Modern_1_label_mask_12.png
-
-
-Only correctly matched pairs are processed.
-
----
-
-## 3. Pipeline Overview
-
-### Step 1 — Feature Extraction
-**Script:** `Feature_extraction_from_images.py`
-
-- Extracts handcrafted features:
-  - Intensity statistics
-  - Texture (LBP, Haralick)
-  - Shape and morphological descriptors
-  - Frequency-domain features (FFT, DWT)
-- Extracts deep features using pretrained CNNs:
-  - VGG16 / VGG19
-  - ResNet50
-  - InceptionResNetV2
-- Uses binary masks to restrict feature computation to ROI pixels
-- Outputs CSV files containing extracted features
-
----
-
-### Step 2 — Feature Preprocessing and Selection
-**Script:** `feature_processing_all_files.py`
-
-- Removes features with:
-  - High missing values
-  - Zero variance or zero IQR
-- Applies:
-  - Stratified 5-fold cross-validation
-  - Robust scaling (trained on training folds only)
-  - Mutual information–based filtering
-  - Correlation-based feature pruning
-  - Boruta feature selection
-- Ensures no data leakage between training and test sets
-- Outputs processed feature sets and selection summaries
-
----
-
-### Step 3 — Machine Learning Training and Evaluation
-**Script:** `ML_classification.py`
-
-- Trains and benchmarks ~20 ML classifiers, including:
-  - LDA / QDA
-  - k-NN
-  - SVM variants
-  - Random Forest, Extra Trees
-  - Gradient Boosting, AdaBoost
-  - XGBoost, CatBoost
-  - MLP, Naive Bayes, SGD, Ridge, Bagging
-- Supports grid-search hyperparameter tuning
-- Produces:
-  - Accuracy, precision, F1-score
-  - ROC and precision–recall curves
-  - Model rankings and saved models
-- Includes checkpointing to resume interrupted runs
-
----
-
-## 4. Recommended Execution Order
+## Scripts and run order
 
 ```bash
-python Feature_extraction_from_images.py
-python feature_processing_all_files.py
-python ML_classification.py
+python Feature_extraction_from_images.py        # pore-only features
+python Feature_extraction_neighbourhood.py      # neighbourhood features
+python feature_processing_all_files.py          # preprocessing, grouped 5-fold CV, Boruta
+python ML_script_all.py                         # 20 classifiers, all folds
+```
+
+Folder paths are set at the top of each script (`main_folder`, `results_root`, `BASE_DIR`) and must be changed to your own locations. The extraction scripts are run once per class folder.
+
+---
+
+## 1. Input data
+
+For each labelled pore:
+
+- `<prefix>_cropped_label_<ID>.png` — RGB crop
+- `<prefix>_label_mask_<ID>.png` — binary pore mask (pore = 255, elsewhere = 0), used in the pore-only run
+- `<prefix>_label_mask_inverted_<ID>.png` — inverted mask (pore = 0), used in the neighbourhood run
+
+The `<prefix>` is the thin-section image name (e.g. `Modern_1`). It is used later as the grouping variable for cross-validation.
+
+For the pore-only run the RGB crop is the bounding box of the pore. For the neighbourhood run it is the bounding box enlarged by 300 pixels on each side.
+
+---
+
+## 2. Feature extraction
+
+Masks are used only to select RGB pixels; the CNNs receive masked RGB images, not binary masks.
+
+**Pore-only run** (`Feature_extraction_from_images.py`), input = RGB crop ⊙ pore mask:
+
+- first-order statistics of the pore pixels
+- size and shape descriptors, Fourier shape descriptors (from the mask)
+- LBP (P/R = 24/8, 16/2, 8/1), Haralick texture, Zernike moments, FFT statistics (grayscale of the masked image)
+- discrete wavelet transform statistics (13 wavelets × 4 sub-bands × 9 statistics); note that these are computed on the **unmasked** bounding-box crop
+- CNN embeddings (ImageNet weights, no fine-tuning, global average pooling): VGG16, VGG19, ResNet50, InceptionResNetV2, DenseNet121, EfficientNetB4 — 7,424 dimensions in total
+
+**Neighbourhood run** (`Feature_extraction_neighbourhood.py`), input = enlarged RGB crop ⊙ inverted mask (the target pore is set to zero):
+
+- LBP, Haralick texture and the same six CNN embeddings; these columns carry the suffix `_NI`
+
+---
+
+## 3. Preprocessing and feature selection
+
+`feature_processing_all_files.py`
+
+- removes features with more than 5% missing values and features with zero variance or zero IQR
+- builds **5 grouped cross-validation folds** with scikit-learn `StratifiedGroupKFold` (`shuffle=True`, `random_state=42`). The group is the thin-section image name taken from the pore label, so all pores of one image are either in the training set or in the test set of a fold. Class balance is approximated at the image level and reported after the split; the script checks that no image appears in both partitions.
+
+Within each training fold only (nothing is fitted on test data):
+
+- robust scaling
+- mutual-information ranking (top 30%) and removal of correlated features (|r| > 0.7)
+- Boruta (BorutaPy 0.4.3): 250-tree random forest, `max_iter=50`, `perc=70`, `two_step=True`, `alpha=0.05`; only confirmed features are kept
+
+The same pipeline is run for six feature sets: traditional, deep-learning and combined features, each pore-only and with neighbourhood features.
+
+---
+
+## 4. Classification
+
+`ML_script_all.py` trains 20 classifiers on every fold with grid-search hyperparameter tuning:
+
+LDA, k-NN, decision tree, random forest, extra trees, AdaBoost, gradient boosting, histogram gradient boosting, XGBoost, CatBoost, bagging, SVM, linear SVM, NuSVC, Gaussian naive Bayes, MLP, SGD, ridge, passive-aggressive and perceptron.
+
+Outputs per fold: saved models, accuracy/precision/F1, classification reports, ROC and precision–recall curves; an aggregate over folds is written at the end. The script checkpoints its progress and can resume.
+
+---
+
+## Environment
+
+Python 3.12, scikit-learn 1.6.1, xgboost 2.1.4, catboost 1.2.7, boruta 0.4.3, TensorFlow/Keras (feature extraction), OpenCV, scikit-image, mahotas, PyWavelets.
+
+---
+
+## Note on an earlier version
+
+An earlier version of this repository contained preprocessing code with ordinary (random) stratified 5-fold splitting. It has been replaced by the thin-section-grouped version above, which is the one used for the results in the paper.
+
+## Data
+
+The thin-section images are subject to confidentiality restrictions and are not included. Extracted feature tables are available from the corresponding author on reasonable request.

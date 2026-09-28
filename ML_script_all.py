@@ -4,10 +4,10 @@ Created on Tue Mar  4 14:43:00 2025
 
 @author: User
 """
-# Save this script as: D:\ML_Pore_Typing\Final_run\ML_classification.py
+
 
 """
-ML Classification Script for Processed Pore Features
+ML Classification Script 
 """
 
 import os
@@ -72,7 +72,7 @@ ENABLE_GRID_SEARCH = True
 
 def get_checkpoint_file():
     """Return the path to the checkpoint file."""
-    base_dir = r"D:\ML_Pore_Typing\Final_run"
+    base_dir = r"D:\ML_Pore_Typing_New_Train_Test"
     return os.path.join(base_dir, "ml_progress_checkpoint.json")
 
 def save_checkpoint(dataset_name, feature_folder, fold, model_name=None):
@@ -693,7 +693,7 @@ def main():
     """Main function to run the ML classification pipeline with checkpointing."""
     global BASE_DIR
     # Base directory where processed data is located
-    BASE_DIR = r"D:\ML_Pore_Typing\Final_run"
+    BASE_DIR = r"D:\ML_Pore_Typing_New_Train_Test"  # Change to match your preprocessing location
     
     # Print checkpoint status
     checkpoint_data = load_checkpoint()
@@ -706,12 +706,12 @@ def main():
     # Define datasets and their feature folders to process
     DATASETS = [
         {
-            "name": "Pore_features",
+            "name": "Pore_Only",
             "folders": ["All_Features", "DL_Features", "Traditional_Features"]
         },
         {
-            "name": "Pore_and_neighbourhood_features",
-            "folders": ["All_Features_NI", "DL_Features_NI", "Traditional_Features_NI"]
+            "name": "Pore_with_neighborhood",
+            "folders": ["All_Features_with_NI", "DL_Features_with_NI", "Traditional_Features_with_NI"]
         }
     ]
     
